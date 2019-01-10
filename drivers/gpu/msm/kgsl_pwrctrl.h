@@ -51,6 +51,12 @@
 #define KGSL_PWR_DEL_LIMIT 1
 #define KGSL_PWR_SET_LIMIT 2
 
+/*
+ * The effective duration of qos request in usecs at wakeup time.
+ * After timeout, qos request is cancelled automatically.
+ */
+#define KGSL_L2PC_WAKEUP_TIMEOUT (10 * 1000)
+
 enum kgsl_pwrctrl_timer_type {
 	KGSL_PWR_IDLE_TIMER,
 };
