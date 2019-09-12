@@ -5253,6 +5253,7 @@ static int __handle_overlay_prepare(struct msm_fb_data_type *mfd,
 	if (sort_needed) {
 		sorted_ovs = kzalloc(num_ovs * sizeof(*ip_ovs), GFP_KERNEL);
 		if (!sorted_ovs) {
+			mutex_unlock(&mdp5_data->ov_lock);
 			pr_err("error allocating ovlist mem\n");
 			mutex_unlock(&mdp5_data->ov_lock);
 			return -ENOMEM;
