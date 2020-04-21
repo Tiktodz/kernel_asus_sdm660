@@ -343,14 +343,6 @@ static void cdfinger_async_report(void)
 
 static irqreturn_t cdfinger_eint_handler(int irq, void *dev_id)
 {
-#if 0
-/* Huaqin modify for cpu_boost by leiyu at 2018/04/25 start */
-	if(screen_status == 0)
-	{
-		sched_set_boost(1);
-	}
-/* Huaqin modify for cpu_boost by leiyu at 2018/04/25 end */
-#endif
 	struct cdfingerfp_data *pdata = g_cdfingerfp_data;
 	if (pdata->irq_enable_status == 1)
 	{
