@@ -1145,7 +1145,7 @@ static ssize_t syna_gesture_mode_set_proc(struct file *filp,
 	}
 	pr_err("syna_gesture_mode = 0x%x, enable_wakeup_gesture = %d \n", (unsigned int)syna_gesture_mode, syna_rmi4_data->enable_wakeup_gesture);
 
-  return count;
+	return count;
 }
 
 static struct proc_dir_entry *syna_gesture_mode_proc = NULL;
