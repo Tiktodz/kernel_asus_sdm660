@@ -3572,7 +3572,7 @@ int smbchg_jeita_judge_state(int old_State, int batt_tempr)
 	} else if (batt_tempr < 100) {
 		result_State = JEITA_STATE_RANGE_0_to_100;
 #ifdef ASUS_CUSTOM_JEITA_SET_MODIFY
-	/* 10 <= batt_tempr < 45 */
+	/* 10 <= batt_tempr < 55 */
 	} else if (batt_tempr < 550) {
 		result_State = JEITA_STATE_RANGE_100_to_450;
 	/* 45 <= batt_tempr < 55 */
@@ -3607,7 +3607,7 @@ int smbchg_jeita_judge_state(int old_State, int batt_tempr)
 			result_State = old_State;
 	} else if (old_State == JEITA_STATE_RANGE_450_to_550 &&
 		result_State == JEITA_STATE_RANGE_100_to_450) {
-		if (batt_tempr >= 420)
+		if (batt_tempr >= 470)
 			result_State = old_State;
 	} else if (old_State == JEITA_STATE_LARGER_THAN_550 &&
 		result_State == JEITA_STATE_RANGE_450_to_550) {
