@@ -1,301 +1,797 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/* binder_alloc_selftest.c
- *
- * Android IPC Subsystem
- *
- * Copyright (C) 2017 Google, Inc.
- */
+/* SPDX-License-Identifier: GPL-2.0 */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <linux/compiler.h>
+#include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/fsnotify.h>
+#include <linux/gfp.h>
+#include <linux/idr.h>
+#include <linux/init.h>
+#include <linux/ipc_namespace.h>
+#include <linux/kdev_t.h>
+#include <linux/kernel.h>
+#include <linux/list.h>
+#include <linux/namei.h>
+#include <linux/magic.h>
+#include <linux/major.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/mount.h>
+#include <linux/parser.h>
+#include <linux/radix-tree.h>
+#include <linux/sched.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/spinlock_types.h>
+#include <linux/stddef.h>
+#include <linux/string.h>
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/user_namespace.h>
+#include <uapi/asm-generic/errno-base.h>
+#include <uapi/linux/android/binder.h>
+#include <uapi/linux/android/binderfs.h>
 
-#include <linux/mm_types.h>
-#include <linux/err.h>
-#include "binder_alloc.h"
+#include "binder_internal.h"
 
-#define BUFFER_NUM 5
-#define BUFFER_MIN_SIZE (PAGE_SIZE / 8)
+#define FIRST_INODE 1
+#define SECOND_INODE 2
+#define INODE_OFFSET 3
+#define INTSTRLEN 21
+#define BINDERFS_MAX_MINOR (1U << MINORBITS)
+/* Ensure that the initial ipc namespace always has devices available. */
+#define BINDERFS_MAX_MINOR_CAPPED (BINDERFS_MAX_MINOR - 4)
 
-static bool binder_selftest_run = true;
-static int binder_selftest_failures;
-static DEFINE_MUTEX(binder_selftest_lock);
+static dev_t binderfs_dev;
+static DEFINE_MUTEX(binderfs_minors_mutex);
+static DEFINE_IDA(binderfs_minors);
 
-/**
- * enum buf_end_align_type - Page alignment of a buffer
- * end with regard to the end of the previous buffer.
- *
- * In the pictures below, buf2 refers to the buffer we
- * are aligning. buf1 refers to previous buffer by addr.
- * Symbol [ means the start of a buffer, ] means the end
- * of a buffer, and | means page boundaries.
- */
-enum buf_end_align_type {
-	/**
-	 * @SAME_PAGE_UNALIGNED: The end of this buffer is on
-	 * the same page as the end of the previous buffer and
-	 * is not page aligned. Examples:
-	 * buf1 ][ buf2 ][ ...
-	 * buf1 ]|[ buf2 ][ ...
-	 */
-	SAME_PAGE_UNALIGNED = 0,
-	/**
-	 * @SAME_PAGE_ALIGNED: When the end of the previous buffer
-	 * is not page aligned, the end of this buffer is on the
-	 * same page as the end of the previous buffer and is page
-	 * aligned. When the previous buffer is page aligned, the
-	 * end of this buffer is aligned to the next page boundary.
-	 * Examples:
-	 * buf1 ][ buf2 ]| ...
-	 * buf1 ]|[ buf2 ]| ...
-	 */
-	SAME_PAGE_ALIGNED,
-	/**
-	 * @NEXT_PAGE_UNALIGNED: The end of this buffer is on
-	 * the page next to the end of the previous buffer and
-	 * is not page aligned. Examples:
-	 * buf1 ][ buf2 | buf2 ][ ...
-	 * buf1 ]|[ buf2 | buf2 ][ ...
-	 */
-	NEXT_PAGE_UNALIGNED,
-	/**
-	 * @NEXT_PAGE_ALIGNED: The end of this buffer is on
-	 * the page next to the end of the previous buffer and
-	 * is page aligned. Examples:
-	 * buf1 ][ buf2 | buf2 ]| ...
-	 * buf1 ]|[ buf2 | buf2 ]| ...
-	 */
-	NEXT_PAGE_ALIGNED,
-	/**
-	 * @NEXT_NEXT_UNALIGNED: The end of this buffer is on
-	 * the page that follows the page after the end of the
-	 * previous buffer and is not page aligned. Examples:
-	 * buf1 ][ buf2 | buf2 | buf2 ][ ...
-	 * buf1 ]|[ buf2 | buf2 | buf2 ][ ...
-	 */
-	NEXT_NEXT_UNALIGNED,
-	LOOP_END,
+enum {
+	Opt_max,
+	Opt_stats_mode,
+	Opt_err
 };
 
-static void pr_err_size_seq(size_t *sizes, int *seq)
-{
-	int i;
+enum binderfs_stats_mode {
+	STATS_NONE,
+	STATS_GLOBAL,
+};
 
-	pr_err("alloc sizes: ");
-	for (i = 0; i < BUFFER_NUM; i++)
-		pr_cont("[%zu]", sizes[i]);
-	pr_cont("\n");
-	pr_err("free seq: ");
-	for (i = 0; i < BUFFER_NUM; i++)
-		pr_cont("[%d]", seq[i]);
-	pr_cont("\n");
+static const match_table_t tokens = {
+	{ Opt_max, "max=%d" },
+	{ Opt_stats_mode, "stats=%s" },
+	{ Opt_err, NULL     }
+};
+
+static inline struct binderfs_info *BINDERFS_I(const struct inode *inode)
+{
+	return inode->i_sb->s_fs_info;
 }
 
-static bool check_buffer_pages_allocated(struct binder_alloc *alloc,
-					 struct binder_buffer *buffer,
-					 size_t size)
+bool is_binderfs_device(const struct inode *inode)
 {
-	void *page_addr, *end;
-	int page_index;
+	if (inode->i_sb->s_magic == BINDERFS_SUPER_MAGIC)
+		return true;
 
-	end = (void *)PAGE_ALIGN((uintptr_t)buffer->data + size);
-	page_addr = buffer->data;
-	for (; page_addr < end; page_addr += PAGE_SIZE) {
-		page_index = (page_addr - alloc->buffer) / PAGE_SIZE;
-		if (!alloc->pages[page_index].page_ptr ||
-		    !list_empty(&alloc->pages[page_index].lru)) {
-			pr_err("expect alloc but is %s at page index %d\n",
-			       alloc->pages[page_index].page_ptr ?
-			       "lru" : "free", page_index);
-			return false;
-		}
-	}
-	return true;
-}
-
-static void binder_selftest_alloc_buf(struct binder_alloc *alloc,
-				      struct binder_buffer *buffers[],
-				      size_t *sizes, int *seq)
-{
-	int i;
-
-	for (i = 0; i < BUFFER_NUM; i++) {
-		buffers[i] = binder_alloc_new_buf(alloc, sizes[i], 0, 0, 0, 0);
-		if (IS_ERR(buffers[i]) ||
-		    !check_buffer_pages_allocated(alloc, buffers[i],
-						  sizes[i])) {
-			pr_err_size_seq(sizes, seq);
-			binder_selftest_failures++;
-		}
-	}
-}
-
-static void binder_selftest_free_buf(struct binder_alloc *alloc,
-				     struct binder_buffer *buffers[],
-				     size_t *sizes, int *seq, size_t end)
-{
-	int i;
-
-	for (i = 0; i < BUFFER_NUM; i++)
-		binder_alloc_free_buf(alloc, buffers[seq[i]]);
-
-	for (i = 0; i < end / PAGE_SIZE; i++) {
-		/**
-		 * Error message on a free page can be false positive
-		 * if binder shrinker ran during binder_alloc_free_buf
-		 * calls above.
-		 */
-		if (list_empty(&alloc->pages[i].lru)) {
-			pr_err_size_seq(sizes, seq);
-			pr_err("expect lru but is %s at page index %d\n",
-			       alloc->pages[i].page_ptr ? "alloc" : "free", i);
-			binder_selftest_failures++;
-		}
-	}
-}
-
-static void binder_selftest_free_page(struct binder_alloc *alloc)
-{
-	int i;
-	unsigned long count;
-
-	while ((count = list_lru_count(&binder_alloc_lru))) {
-		list_lru_walk(&binder_alloc_lru, binder_alloc_free_page,
-			      NULL, count);
-	}
-
-	for (i = 0; i < (alloc->buffer_size / PAGE_SIZE); i++) {
-		if (alloc->pages[i].page_ptr) {
-			pr_err("expect free but is %s at page index %d\n",
-			       list_empty(&alloc->pages[i].lru) ?
-			       "alloc" : "lru", i);
-			binder_selftest_failures++;
-		}
-	}
-}
-
-static void binder_selftest_alloc_free(struct binder_alloc *alloc,
-				       size_t *sizes, int *seq, size_t end)
-{
-	struct binder_buffer *buffers[BUFFER_NUM];
-
-	binder_selftest_alloc_buf(alloc, buffers, sizes, seq);
-	binder_selftest_free_buf(alloc, buffers, sizes, seq, end);
-
-	/* Allocate from lru. */
-	binder_selftest_alloc_buf(alloc, buffers, sizes, seq);
-	if (list_lru_count(&binder_alloc_lru))
-		pr_err("lru list should be empty but is not\n");
-
-	binder_selftest_free_buf(alloc, buffers, sizes, seq, end);
-	binder_selftest_free_page(alloc);
-}
-
-static bool is_dup(int *seq, int index, int val)
-{
-	int i;
-
-	for (i = 0; i < index; i++) {
-		if (seq[i] == val)
-			return true;
-	}
 	return false;
 }
 
-/* Generate BUFFER_NUM factorial free orders. */
-static void binder_selftest_free_seq(struct binder_alloc *alloc,
-				     size_t *sizes, int *seq,
-				     int index, size_t end)
+/**
+ * binderfs_binder_device_create - allocate inode from super block of a
+ *                                 binderfs mount
+ * @ref_inode: inode from wich the super block will be taken
+ * @userp:     buffer to copy information about new device for userspace to
+ * @req:       struct binderfs_device as copied from userspace
+ *
+ * This function allocates a new binder_device and reserves a new minor
+ * number for it.
+ * Minor numbers are limited and tracked globally in binderfs_minors. The
+ * function will stash a struct binder_device for the specific binder
+ * device in i_private of the inode.
+ * It will go on to allocate a new inode from the super block of the
+ * filesystem mount, stash a struct binder_device in its i_private field
+ * and attach a dentry to that inode.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int binderfs_binder_device_create(struct inode *ref_inode,
+					 struct binderfs_device __user *userp,
+					 struct binderfs_device *req)
 {
-	int i;
+	int minor, ret;
+	struct dentry *dentry, *root;
+	struct binder_device *device;
+	char *name = NULL;
+	size_t name_len;
+	struct inode *inode = NULL;
+	struct super_block *sb = ref_inode->i_sb;
+	struct binderfs_info *info = sb->s_fs_info;
+#if defined(CONFIG_IPC_NS)
+	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
+#else
+	bool use_reserve = true;
+#endif
 
-	if (index == BUFFER_NUM) {
-		binder_selftest_alloc_free(alloc, sizes, seq, end);
-		return;
+	/* Reserve new minor number for the new device. */
+	mutex_lock(&binderfs_minors_mutex);
+	if (++info->device_count <= info->mount_opts.max)
+		minor = ida_simple_get(&binderfs_minors, 0,
+				      use_reserve ? BINDERFS_MAX_MINOR + 1:
+						    BINDERFS_MAX_MINOR_CAPPED + 1,
+				      GFP_KERNEL);
+	else
+		minor = -ENOSPC;
+	if (minor < 0) {
+		--info->device_count;
+		mutex_unlock(&binderfs_minors_mutex);
+		return minor;
 	}
-	for (i = 0; i < BUFFER_NUM; i++) {
-		if (is_dup(seq, index, i))
-			continue;
-		seq[index] = i;
-		binder_selftest_free_seq(alloc, sizes, seq, index + 1, end);
+	mutex_unlock(&binderfs_minors_mutex);
+
+	ret = -ENOMEM;
+	device = kzalloc(sizeof(*device), GFP_KERNEL);
+	if (!device)
+		goto err;
+
+	inode = new_inode(sb);
+	if (!inode)
+		goto err;
+
+	inode->i_ino = minor + INODE_OFFSET;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+	init_special_inode(inode, S_IFCHR | 0600,
+			   MKDEV(MAJOR(binderfs_dev), minor));
+	inode->i_fop = &binder_fops;
+	inode->i_uid = info->root_uid;
+	inode->i_gid = info->root_gid;
+
+	req->name[BINDERFS_MAX_NAME] = '\0'; /* NUL-terminate */
+	name_len = strlen(req->name);
+	/* Make sure to include terminating NUL byte */
+	name = kmemdup(req->name, name_len + 1, GFP_KERNEL);
+	if (!name)
+		goto err;
+
+	refcount_set(&device->ref, 1);
+	device->binderfs_inode = inode;
+	device->context.binder_context_mgr_uid = INVALID_UID;
+	device->context.name = name;
+	device->miscdev.name = name;
+	device->miscdev.minor = minor;
+	mutex_init(&device->context.context_mgr_node_lock);
+
+	req->major = MAJOR(binderfs_dev);
+	req->minor = minor;
+
+	if (userp && copy_to_user(userp, req, sizeof(*req))) {
+		ret = -EFAULT;
+		goto err;
 	}
+
+	root = sb->s_root;
+	inode_lock(d_inode(root));
+
+	/* look it up */
+	dentry = lookup_one_len(name, root, name_len);
+	if (IS_ERR(dentry)) {
+		inode_unlock(d_inode(root));
+		ret = PTR_ERR(dentry);
+		goto err;
+	}
+
+	if (d_really_is_positive(dentry)) {
+		/* already exists */
+		dput(dentry);
+		inode_unlock(d_inode(root));
+		ret = -EEXIST;
+		goto err;
+	}
+
+	inode->i_private = device;
+	d_instantiate(dentry, inode);
+	fsnotify_create(root->d_inode, dentry);
+	inode_unlock(d_inode(root));
+
+	return 0;
+
+err:
+	kfree(name);
+	kfree(device);
+	mutex_lock(&binderfs_minors_mutex);
+	--info->device_count;
+	ida_remove(&binderfs_minors, minor);
+	mutex_unlock(&binderfs_minors_mutex);
+	iput(inode);
+
+	return ret;
 }
 
-static void binder_selftest_alloc_size(struct binder_alloc *alloc,
-				       size_t *end_offset)
+/**
+ * binderfs_ctl_ioctl - handle binder device node allocation requests
+ *
+ * The request handler for the binder-control device. All requests operate on
+ * the binderfs mount the binder-control device resides in:
+ * - BINDER_CTL_ADD
+ *   Allocate a new binder device.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static long binder_ctl_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
 {
-	int i;
-	int seq[BUFFER_NUM] = {0};
-	size_t front_sizes[BUFFER_NUM];
-	size_t back_sizes[BUFFER_NUM];
-	size_t last_offset, offset = 0;
+	int ret = -EINVAL;
+	struct inode *inode = file_inode(file);
+	struct binderfs_device __user *device = (struct binderfs_device __user *)arg;
+	struct binderfs_device device_req;
 
-	for (i = 0; i < BUFFER_NUM; i++) {
-		last_offset = offset;
-		offset = end_offset[i];
-		front_sizes[i] = offset - last_offset;
-		back_sizes[BUFFER_NUM - i - 1] = front_sizes[i];
+	switch (cmd) {
+	case BINDER_CTL_ADD:
+		ret = copy_from_user(&device_req, device, sizeof(device_req));
+		if (ret) {
+			ret = -EFAULT;
+			break;
+		}
+
+		ret = binderfs_binder_device_create(inode, device, &device_req);
+		break;
+	default:
+		break;
 	}
-	/*
-	 * Buffers share the first or last few pages.
-	 * Only BUFFER_NUM - 1 buffer sizes are adjustable since
-	 * we need one giant buffer before getting to the last page.
-	 */
-	back_sizes[0] += alloc->buffer_size - end_offset[BUFFER_NUM - 1];
-	binder_selftest_free_seq(alloc, front_sizes, seq, 0,
-				 end_offset[BUFFER_NUM - 1]);
-	binder_selftest_free_seq(alloc, back_sizes, seq, 0, alloc->buffer_size);
+
+	return ret;
 }
 
-static void binder_selftest_alloc_offset(struct binder_alloc *alloc,
-					 size_t *end_offset, int index)
+static void binderfs_evict_inode(struct inode *inode)
 {
-	int align;
-	size_t end, prev;
+	struct binder_device *device = inode->i_private;
+	struct binderfs_info *info = BINDERFS_I(inode);
 
-	if (index == BUFFER_NUM) {
-		binder_selftest_alloc_size(alloc, end_offset);
+	clear_inode(inode);
+
+	if (!S_ISCHR(inode->i_mode) || !device)
 		return;
-	}
-	prev = index == 0 ? 0 : end_offset[index - 1];
-	end = prev;
 
-	BUILD_BUG_ON(BUFFER_MIN_SIZE * BUFFER_NUM >= PAGE_SIZE);
+	mutex_lock(&binderfs_minors_mutex);
+	--info->device_count;
+	ida_remove(&binderfs_minors, device->miscdev.minor);
+	mutex_unlock(&binderfs_minors_mutex);
 
-	for (align = SAME_PAGE_UNALIGNED; align < LOOP_END; align++) {
-		if (align % 2)
-			end = ALIGN(end, PAGE_SIZE);
-		else
-			end += BUFFER_MIN_SIZE;
-		end_offset[index] = end;
-		binder_selftest_alloc_offset(alloc, end_offset, index + 1);
+	if (refcount_dec_and_test(&device->ref)) {
+		kfree(device->context.name);
+		kfree(device);
 	}
 }
 
 /**
- * binder_selftest_alloc() - Test alloc and free of buffer pages.
- * @alloc: Pointer to alloc struct.
- *
- * Allocate BUFFER_NUM buffers to cover all page alignment cases,
- * then free them in all orders possible. Check that pages are
- * correctly allocated, put onto lru when buffers are freed, and
- * are freed when binder_alloc_free_page is called.
+ * binderfs_parse_mount_opts - parse binderfs mount options
+ * @data: options to set (can be NULL in which case defaults are used)
  */
-void binder_selftest_alloc(struct binder_alloc *alloc)
+static int binderfs_parse_mount_opts(char *data,
+				     struct binderfs_mount_opts *opts)
 {
-	size_t end_offset[BUFFER_NUM];
+	char *p, *stats;
+	opts->max = BINDERFS_MAX_MINOR;
+	opts->stats_mode = STATS_NONE;
 
-	if (!binder_selftest_run)
-		return;
-	mutex_lock(&binder_selftest_lock);
-	if (!binder_selftest_run || !alloc->vma)
-		goto done;
-	pr_info("STARTED\n");
-	binder_selftest_alloc_offset(alloc, end_offset, 0);
-	binder_selftest_run = false;
-	if (binder_selftest_failures > 0)
-		pr_info("%d tests FAILED\n", binder_selftest_failures);
-	else
-		pr_info("PASSED\n");
+	while ((p = strsep(&data, ",")) != NULL) {
+		substring_t args[MAX_OPT_ARGS];
+		int token;
+		int max_devices;
 
-done:
-	mutex_unlock(&binder_selftest_lock);
+		if (!*p)
+			continue;
+
+		token = match_token(p, tokens, args);
+		switch (token) {
+		case Opt_max:
+			if (match_int(&args[0], &max_devices) ||
+			    (max_devices < 0 ||
+			     (max_devices > BINDERFS_MAX_MINOR)))
+				return -EINVAL;
+
+			opts->max = max_devices;
+			break;
+		case Opt_stats_mode:
+			if (!capable(CAP_SYS_ADMIN))
+				return -EINVAL;
+
+			stats = match_strdup(&args[0]);
+			if (!stats)
+				return -ENOMEM;
+
+			if (strcmp(stats, "global") != 0) {
+				kfree(stats);
+				return -EINVAL;
+			}
+
+			opts->stats_mode = STATS_GLOBAL;
+			kfree(stats);
+			break;
+		default:
+			pr_err("Invalid mount options\n");
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int binderfs_remount(struct super_block *sb, int *flags, char *data)
+{
+	int prev_stats_mode, ret;
+	struct binderfs_info *info = sb->s_fs_info;
+
+	prev_stats_mode = info->mount_opts.stats_mode;
+	ret = binderfs_parse_mount_opts(data, &info->mount_opts);
+	if (ret)
+		return ret;
+
+	if (prev_stats_mode != info->mount_opts.stats_mode) {
+		pr_err("Binderfs stats mode cannot be changed during a remount\n");
+		info->mount_opts.stats_mode = prev_stats_mode;
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int binderfs_show_mount_opts(struct seq_file *seq, struct dentry *root)
+{
+	struct binderfs_info *info;
+
+	info = root->d_sb->s_fs_info;
+	if (info->mount_opts.max <= BINDERFS_MAX_MINOR)
+		seq_printf(seq, ",max=%d", info->mount_opts.max);
+	if (info->mount_opts.stats_mode == STATS_GLOBAL)
+		seq_printf(seq, ",stats=global");
+
+	return 0;
+}
+
+static const struct super_operations binderfs_super_ops = {
+	.evict_inode    = binderfs_evict_inode,
+	.remount_fs	= binderfs_remount,
+	.show_options	= binderfs_show_mount_opts,
+	.statfs         = simple_statfs,
+};
+
+static inline bool is_binderfs_control_device(const struct dentry *dentry)
+{
+	struct binderfs_info *info = dentry->d_sb->s_fs_info;
+	return info->control_dentry == dentry;
+}
+
+static int binderfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+			   struct inode *new_dir, struct dentry *new_dentry,
+			   unsigned int flags)
+{
+	if (is_binderfs_control_device(old_dentry) ||
+	    is_binderfs_control_device(new_dentry))
+		return -EPERM;
+
+	return simple_rename2(old_dir, old_dentry, new_dir, new_dentry, flags);
+}
+
+static int binderfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	if (is_binderfs_control_device(dentry))
+		return -EPERM;
+
+	return simple_unlink(dir, dentry);
+}
+
+static const struct file_operations binder_ctl_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nonseekable_open,
+	.unlocked_ioctl	= binder_ctl_ioctl,
+	.compat_ioctl	= binder_ctl_ioctl,
+	.llseek		= noop_llseek,
+};
+
+/**
+ * binderfs_binder_ctl_create - create a new binder-control device
+ * @sb: super block of the binderfs mount
+ *
+ * This function creates a new binder-control device node in the binderfs mount
+ * referred to by @sb.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int binderfs_binder_ctl_create(struct super_block *sb)
+{
+	int minor, ret;
+	struct dentry *dentry;
+	struct binder_device *device;
+	struct inode *inode = NULL;
+	struct dentry *root = sb->s_root;
+	struct binderfs_info *info = sb->s_fs_info;
+#if defined(CONFIG_IPC_NS)
+	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
+#else
+	bool use_reserve = true;
+#endif
+
+	device = kzalloc(sizeof(*device), GFP_KERNEL);
+	if (!device)
+		return -ENOMEM;
+
+	/* If we have already created a binder-control node, return. */
+	if (info->control_dentry) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = -ENOMEM;
+	inode = new_inode(sb);
+	if (!inode)
+		goto out;
+
+	/* Reserve a new minor number for the new device. */
+	mutex_lock(&binderfs_minors_mutex);
+	minor = ida_simple_get(&binderfs_minors, 0,
+			      use_reserve ? BINDERFS_MAX_MINOR  + 1:
+					    BINDERFS_MAX_MINOR_CAPPED + 1,
+			      GFP_KERNEL);
+	mutex_unlock(&binderfs_minors_mutex);
+	if (minor < 0) {
+		ret = minor;
+		goto out;
+	}
+
+	inode->i_ino = SECOND_INODE;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+	init_special_inode(inode, S_IFCHR | 0600,
+			   MKDEV(MAJOR(binderfs_dev), minor));
+	inode->i_fop = &binder_ctl_fops;
+	inode->i_uid = info->root_uid;
+	inode->i_gid = info->root_gid;
+
+	refcount_set(&device->ref, 1);
+	device->binderfs_inode = inode;
+	device->miscdev.minor = minor;
+
+	dentry = d_alloc_name(root, "binder-control");
+	if (!dentry)
+		goto out;
+
+	inode->i_private = device;
+	info->control_dentry = dentry;
+	d_add(dentry, inode);
+
+	return 0;
+
+out:
+	kfree(device);
+	iput(inode);
+
+	return ret;
+}
+
+static const struct inode_operations binderfs_dir_inode_operations = {
+	.lookup = simple_lookup,
+	.rename = binderfs_rename,
+	.unlink = binderfs_unlink,
+};
+
+static struct inode *binderfs_make_inode(struct super_block *sb, int mode)
+{
+	struct inode *ret;
+
+	ret = new_inode(sb);
+	if (ret) {
+		ret->i_ino = iunique(sb, BINDERFS_MAX_MINOR + INODE_OFFSET);
+		ret->i_mode = mode;
+		ret->i_atime = ret->i_mtime = ret->i_ctime = CURRENT_TIME;
+	}
+	return ret;
+}
+
+static struct dentry *binderfs_create_dentry(struct dentry *parent,
+					     const char *name)
+{
+	struct dentry *dentry;
+
+	dentry = lookup_one_len(name, parent, strlen(name));
+	if (IS_ERR(dentry))
+		return dentry;
+
+	/* Return error if the file/dir already exists. */
+	if (d_really_is_positive(dentry)) {
+		dput(dentry);
+		return ERR_PTR(-EEXIST);
+	}
+
+	return dentry;
+}
+
+void binderfs_remove_file(struct dentry *dentry)
+{
+	struct inode *parent_inode;
+
+	parent_inode = d_inode(dentry->d_parent);
+	inode_lock(parent_inode);
+	if (simple_positive(dentry)) {
+		dget(dentry);
+		simple_unlink(parent_inode, dentry);
+		d_delete(dentry);
+		dput(dentry);
+	}
+	inode_unlock(parent_inode);
+}
+
+struct dentry *binderfs_create_file(struct dentry *parent, const char *name,
+				    const struct file_operations *fops,
+				    void *data)
+{
+	struct dentry *dentry;
+	struct inode *new_inode, *parent_inode;
+	struct super_block *sb;
+
+	parent_inode = d_inode(parent);
+	inode_lock(parent_inode);
+
+	dentry = binderfs_create_dentry(parent, name);
+	if (IS_ERR(dentry))
+		goto out;
+
+	sb = parent_inode->i_sb;
+	new_inode = binderfs_make_inode(sb, S_IFREG | 0444);
+	if (!new_inode) {
+		dput(dentry);
+		dentry = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+
+	new_inode->i_fop = fops;
+	new_inode->i_private = data;
+	d_instantiate(dentry, new_inode);
+	fsnotify_create(parent_inode, dentry);
+
+out:
+	inode_unlock(parent_inode);
+	return dentry;
+}
+
+static struct dentry *binderfs_create_dir(struct dentry *parent,
+					  const char *name)
+{
+	struct dentry *dentry;
+	struct inode *new_inode, *parent_inode;
+	struct super_block *sb;
+
+	parent_inode = d_inode(parent);
+	inode_lock(parent_inode);
+
+	dentry = binderfs_create_dentry(parent, name);
+	if (IS_ERR(dentry))
+		goto out;
+
+	sb = parent_inode->i_sb;
+	new_inode = binderfs_make_inode(sb, S_IFDIR | 0755);
+	if (!new_inode) {
+		dput(dentry);
+		dentry = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+
+	new_inode->i_fop = &simple_dir_operations;
+	new_inode->i_op = &simple_dir_inode_operations;
+
+	set_nlink(new_inode, 2);
+	d_instantiate(dentry, new_inode);
+	inc_nlink(parent_inode);
+	fsnotify_mkdir(parent_inode, dentry);
+
+out:
+	inode_unlock(parent_inode);
+	return dentry;
+}
+
+static int init_binder_logs(struct super_block *sb)
+{
+	struct dentry *binder_logs_root_dir, *dentry, *proc_log_dir;
+	struct binderfs_info *info;
+	int ret = 0;
+
+	binder_logs_root_dir = binderfs_create_dir(sb->s_root,
+						   "binder_logs");
+	if (IS_ERR(binder_logs_root_dir)) {
+		ret = PTR_ERR(binder_logs_root_dir);
+		goto out;
+	}
+
+	dentry = binderfs_create_file(binder_logs_root_dir, "stats",
+				      &binder_stats_fops, NULL);
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+		goto out;
+	}
+
+	dentry = binderfs_create_file(binder_logs_root_dir, "state",
+				      &binder_state_fops, NULL);
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+		goto out;
+	}
+
+	dentry = binderfs_create_file(binder_logs_root_dir, "transactions",
+				      &binder_transactions_fops, NULL);
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+		goto out;
+	}
+
+	dentry = binderfs_create_file(binder_logs_root_dir,
+				      "transaction_log",
+				      &binder_transaction_log_fops,
+				      &binder_transaction_log);
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+		goto out;
+	}
+
+	dentry = binderfs_create_file(binder_logs_root_dir,
+				      "failed_transaction_log",
+				      &binder_transaction_log_fops,
+				      &binder_transaction_log_failed);
+	if (IS_ERR(dentry)) {
+		ret = PTR_ERR(dentry);
+		goto out;
+	}
+
+	proc_log_dir = binderfs_create_dir(binder_logs_root_dir, "proc");
+	if (IS_ERR(proc_log_dir)) {
+		ret = PTR_ERR(proc_log_dir);
+		goto out;
+	}
+	info = sb->s_fs_info;
+	info->proc_log_dir = proc_log_dir;
+
+out:
+	return ret;
+}
+
+static int binderfs_fill_super(struct super_block *sb, void *data, int silent)
+{
+	int ret;
+	struct binderfs_info *info;
+	struct inode *inode = NULL;
+	struct binderfs_device device_info = { { 0 } };
+	const char *name;
+	size_t len;
+
+	sb->s_blocksize = PAGE_SIZE;
+	sb->s_blocksize_bits = PAGE_SHIFT;
+
+	/*
+	 * The binderfs filesystem can be mounted by userns root in a
+	 * non-initial userns. By default such mounts have the SB_I_NODEV flag
+	 * set in s_iflags to prevent security issues where userns root can
+	 * just create random device nodes via mknod() since it owns the
+	 * filesystem mount. But binderfs does not allow to create any files
+	 * including devices nodes. The only way to create binder devices nodes
+	 * is through the binder-control device which userns root is explicitly
+	 * allowed to do. So removing the SB_I_NODEV flag from s_iflags is both
+	 * necessary and safe.
+	 */
+	sb->s_iflags &= ~SB_I_NODEV;
+	sb->s_iflags |= SB_I_NOEXEC;
+	sb->s_magic = BINDERFS_SUPER_MAGIC;
+	sb->s_op = &binderfs_super_ops;
+	sb->s_time_gran = 1;
+
+	sb->s_fs_info = kzalloc(sizeof(struct binderfs_info), GFP_KERNEL);
+	if (!sb->s_fs_info)
+		return -ENOMEM;
+	info = sb->s_fs_info;
+
+	info->ipc_ns = get_ipc_ns(current->nsproxy->ipc_ns);
+
+	ret = binderfs_parse_mount_opts(data, &info->mount_opts);
+	if (ret)
+		return ret;
+
+	info->root_gid = make_kgid(&init_user_ns, 0);
+	if (!gid_valid(info->root_gid))
+		info->root_gid = GLOBAL_ROOT_GID;
+	info->root_uid = make_kuid(&init_user_ns, 0);
+	if (!uid_valid(info->root_uid))
+		info->root_uid = GLOBAL_ROOT_UID;
+
+	inode = new_inode(sb);
+	if (!inode)
+		return -ENOMEM;
+
+	inode->i_ino = FIRST_INODE;
+	inode->i_fop = &simple_dir_operations;
+	inode->i_mode = S_IFDIR | 0755;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+	inode->i_op = &binderfs_dir_inode_operations;
+	set_nlink(inode, 2);
+
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+
+	ret = binderfs_binder_ctl_create(sb);
+	if (ret)
+		return ret;
+
+	name = binder_devices_param;
+	for (len = strcspn(name, ","); len > 0; len = strcspn(name, ",")) {
+		strscpy(device_info.name, name, len + 1);
+		ret = binderfs_binder_device_create(inode, NULL, &device_info);
+		if (ret)
+			return ret;
+		name += len;
+		if (*name == ',')
+			name++;
+	}
+
+	if (info->mount_opts.stats_mode == STATS_GLOBAL)
+		return init_binder_logs(sb);
+
+	return 0;
+}
+
+static struct dentry *binderfs_mount(struct file_system_type *fs_type,
+				     int flags, const char *dev_name,
+				     void *data)
+{
+	return mount_nodev(fs_type, flags, data, binderfs_fill_super);
+}
+
+static void binderfs_kill_super(struct super_block *sb)
+{
+	struct binderfs_info *info = sb->s_fs_info;
+
+	kill_litter_super(sb);
+
+	if (info && info->ipc_ns)
+		put_ipc_ns(info->ipc_ns);
+
+	kfree(info);
+}
+
+static struct file_system_type binder_fs_type = {
+	.name		= "binder",
+	.mount		= binderfs_mount,
+	.kill_sb	= binderfs_kill_super,
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+
+int __init init_binderfs(void)
+{
+	if (get_android_version() < 11)
+		return 0;
+	else {
+		int ret;
+		const char *name;
+		size_t len;
+
+		/* Verify that the default binderfs device names are valid. */
+		name = binder_devices_param;
+		for (len = strcspn(name, ","); len > 0; len = strcspn(name, ",")) {
+			if (len > BINDERFS_MAX_NAME)
+				return -E2BIG;
+			name += len;
+			if (*name == ',')
+				name++;
+		}
+
+		/* Allocate new major number for binderfs. */
+		ret = alloc_chrdev_region(&binderfs_dev, 0, BINDERFS_MAX_MINOR,
+					  "binder");
+		if (ret)
+			return ret;
+
+		ret = register_filesystem(&binder_fs_type);
+		if (ret) {
+			unregister_chrdev_region(binderfs_dev, BINDERFS_MAX_MINOR);
+			return ret;
+		}
+
+		return ret;
+	}
 }
